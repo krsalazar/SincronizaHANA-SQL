@@ -16,12 +16,13 @@ def transferir_datos(empresa_id, empresa_nombre, empresa_nit, fecha_inicio, fech
     
     # Se usa una f-string (nota las llaves dobles {{ }} en el DRIVER para escapar el formato)
     sql_conn_str = (
-        f'DRIVER={{ODBC Driver 17 for SQL Server}};'
-        f'SERVER={sql_server};'
-        f'DATABASE={sql_db};'
-        f'UID={sql_user};'
-        f'PWD={sql_pass}'
-    )
+            f'DRIVER={{ODBC Driver 18 for SQL Server}};'  # Cambio al driver 18
+            f'SERVER={sql_server};'
+            f'DATABASE={sql_db};'
+            f'UID={sql_user};'
+            f'PWD={sql_pass};'
+            f'TrustServerCertificate=yes;' # Obligatorio en v18 si tu SQL no tiene certificado SSL firmado
+        )
     
     # 2. Configuración de conexión a SAP HANA
     hana_host = os.getenv('HANA_HOST')
