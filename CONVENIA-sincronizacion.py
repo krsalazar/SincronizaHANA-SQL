@@ -1,40 +1,55 @@
-import pyodbc
-from hdbcli import dbapi
+import pyodbc 
+from hdbcli import dbapi 
 import streamlit as st
 import os
 from dotenv import load_dotenv
 
-# Esto lee el archivo .env y carga las variables a la memoria
+# Cargar las variables de entorno desde el archivo .env
 load_dotenv()
 
+def normalizar_estatus(estatus): 
+    """
+    Normaliza el estatus para que NULL, vacío ('') o 'ACTIVO' sean tratados 
+    como equivalentes ('ACTIVO'). Cualquier otro ('ANULADO') se mantiene.
+    """ 
+    if estatus is None: 
+        return 'ACTIVO' 
+    
+    estatus_str = str(estatus).strip().upper() 
+    if estatus_str == '' or estatus_str == 'ACTIVO': 
+        return 'ACTIVO' 
+        
+    return estatus_str 
+
 def transferir_datos(empresa_id, empresa_nombre, empresa_nit, fecha_inicio, fecha_fin):
-    # 1. Configuración de conexión a SQL Server
+    # 1. Configuración de conexión a SQL Server desde .env
     sql_server = os.getenv('SQL_SERVER')
     sql_db = os.getenv('SQL_DB')
     sql_user = os.getenv('SQL_USER')
     sql_pass = os.getenv('SQL_PASS')
     
-    # Se usa una f-string (nota las llaves dobles {{ }} en el DRIVER para escapar el formato)
+    # Cadena actualizada para ODBC Driver 18 con TrustServerCertificate
     sql_conn_str = (
-            f'DRIVER={{ODBC Driver 18 for SQL Server}};'  # Cambio al driver 18
-            f'SERVER={sql_server};'
-            f'DATABASE={sql_db};'
-            f'UID={sql_user};'
-            f'PWD={sql_pass};'
-            f'TrustServerCertificate=yes;' # Obligatorio en v18 si tu SQL no tiene certificado SSL firmado
-        )
+        f'DRIVER={{ODBC Driver 18 for SQL Server}};'
+        f'SERVER={sql_server};'
+        f'DATABASE={sql_db};'
+        f'UID={sql_user};'
+        f'PWD={sql_pass};'
+        f'TrustServerCertificate=yes;'
+    )
     
-    # 2. Configuración de conexión a SAP HANA
+    # 2. Configuración de conexión a SAP HANA desde .env
     hana_host = os.getenv('HANA_HOST')
-    hana_port = 30015 
+    hana_port = 30015  
     hana_user = os.getenv('HANA_USER')
     hana_password = os.getenv('HANA_PASS')
+
     try:
-        print("Conectando a SQL Server...") 
+        # --- 1. EXTRACCIÓN (SQL Server) --- 
         sql_conn = pyodbc.connect(sql_conn_str) 
         sql_cursor = sql_conn.cursor() 
 
-        # Consulta parametrizada con '?'
+        # Consulta con parámetros dinámicos (?)
         consulta_extraccion = """
        WITH ResumenDetalle AS (
             SELECT 
@@ -49,7 +64,7 @@ def transferir_datos(empresa_id, empresa_nombre, empresa_nit, fecha_inicio, fech
             SELECT 
                 T0.DocumentoID,
                 'CONVENIA',
-                ?, -- [Reemplazo] Nombre dinámico de la empresa
+                ?, -- [Dinámico] Empresa
                 T0.IdReceptor,
                 T0.UUID,
                 T0.Serie,
@@ -65,44 +80,109 @@ def transferir_datos(empresa_id, empresa_nombre, empresa_nit, fecha_inicio, fech
                 ISNULL(RD.OTROS_PRODUCTOS, 0)*T0.TipoCambio,
                 0,
                 T0.CorteID,
-                ?, -- [Reemplazo] NIT dinámico
+                ?, -- [Dinámico] NIT
                 CASE 
                     WHEN T0.UltimoEstadoBitacora = 8 THEN 'ANULADO' 
                     ELSE 'ACTIVO' 
                 END
             FROM Documentos T0
             LEFT JOIN ResumenDetalle RD ON T0.DocumentoID = RD.DocumentoID
-            WHERE EmpresaID = ? -- [Reemplazo] ID de Empresa dinámico
-            AND CONVERT(DATE, FechaEmision) >= ? AND CONVERT(DATE, FechaEmision) <= ? -- [Reemplazo] Fechas dinámicas
+            WHERE EmpresaID = ? -- [Dinámico] ID de Empresa
+            AND CONVERT(DATE, FechaEmision) >= ? AND CONVERT(DATE, FechaEmision) <= ? -- [Dinámico] Fechas
         """
-
-        # Pasamos las variables a pyodbc en el orden exacto de los '?'
+        
         parametros = (empresa_nombre, empresa_nit, empresa_id, fecha_inicio, fecha_fin)
         sql_cursor.execute(consulta_extraccion, parametros)
         
         datos_sql = sql_cursor.fetchall() 
-        print(f"Se extrajeron {len(datos_sql)} registros de SQL Server.") 
-
+        
         if not datos_sql: 
-            return "No hay datos nuevos para procesar."
+            return "No hay datos nuevos para procesar en el rango seleccionado."
 
-       
-        return f"Proceso completado. Registros extraídos: {len(datos_sql)}."
+        # --- 2. CONSULTA DE DOCUMENTOS EXISTENTES EN HANA --- 
+        hana_conn = dbapi.connect(address=hana_host, port=hana_port, user=hana_user, password=hana_password) 
+        hana_cursor = hana_conn.cursor() 
+
+        # Extraemos solo los UUID (están en la posición 4 de la consulta SQL) 
+        uuids_sql = [fila[4] for fila in datos_sql] 
+        diccionario_hana = {} 
+        tamano_lote = 1000  
+        
+        for i in range(0, len(uuids_sql), tamano_lote): 
+            lote_uuids = uuids_sql[i:i + tamano_lote] 
+            placeholders = ', '.join(['?'] * len(lote_uuids)) 
+            
+            consulta_hana_existentes = f"SELECT UUID, ESTATUS FROM SBO_DW_FEL.DOCUMENTOS WHERE UUID IN ({placeholders})" 
+            hana_cursor.execute(consulta_hana_existentes, lote_uuids) 
+            datos_hana_lote = hana_cursor.fetchall() 
+            
+            for fila_hana in datos_hana_lote: 
+                diccionario_hana[fila_hana[0]] = fila_hana[1] 
+                
+        # --- 3. CLASIFICACIÓN (Insertar vs Actualizar) --- 
+        lista_insertar = [] 
+        lista_actualizar = [] 
+
+        for fila in datos_sql: 
+            uuid = fila[4] 
+            estatus_sql = normalizar_estatus(fila[19]) 
+
+            if uuid not in diccionario_hana: 
+                lista_insertar.append(tuple(fila)) 
+            else: 
+                estatus_hana = normalizar_estatus(diccionario_hana[uuid]) 
+                if estatus_sql != estatus_hana: 
+                    fila_actualizar = tuple(fila) + (uuid,) 
+                    lista_actualizar.append(fila_actualizar) 
+
+        # --- 4. CARGA A SAP HANA --- 
+        if lista_insertar: 
+            consulta_insercion = """
+            INSERT INTO SBO_DW_FEL.DOCUMENTOS (
+                ID, SOURCE, EMPRESA, NIT, UUID, SERIE, NUMERO, MONTO, IVA, IDP, 
+                FECHA, TIPO, ESTACION, ESTABLECIMIENTO, SERVICIOS, OTROS_PRODUCTOS, 
+                COMBUSTIBLE, CORTE, NITEMISOR, ESTATUS
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """ 
+            hana_cursor.executemany(consulta_insercion, lista_insertar) 
+
+        if lista_actualizar: 
+            consulta_actualizacion = """
+            UPDATE SBO_DW_FEL.DOCUMENTOS SET 
+                ID=?, SOURCE=?, EMPRESA=?, NIT=?, UUID=?, SERIE=?, NUMERO=?, MONTO=?, IVA=?, IDP=?, 
+                FECHA=?, TIPO=?, ESTACION=?, ESTABLECIMIENTO=?, SERVICIOS=?, OTROS_PRODUCTOS=?, 
+                COMBUSTIBLE=?, CORTE=?, NITEMISOR=?, ESTATUS=?
+            WHERE UUID=?
+            """ 
+            hana_cursor.executemany(consulta_actualizacion, lista_actualizar) 
+
+        hana_conn.commit() 
+        
+        # Resumen final para la interfaz
+        resumen = f"Proceso completado con éxito. Extracción SQL: {len(datos_sql)} | "
+        if lista_insertar or lista_actualizar:
+            resumen += f"Insertados: {len(lista_insertar)} | Actualizados: {len(lista_actualizar)}"
+        else:
+            resumen += "Todos los registros ya estaban en HANA y sin cambios."
+            
+        return resumen
 
     except Exception as e: 
-        return f"Ocurrió un error crítico: {e}" 
-    
+        if 'hana_conn' in locals(): hana_conn.rollback() 
+        return f"Ocurrió un error crítico: {e}"
+
     finally: 
         if 'sql_cursor' in locals(): sql_cursor.close() 
         if 'sql_conn' in locals(): sql_conn.close() 
         if 'hana_cursor' in locals(): hana_cursor.close() 
         if 'hana_conn' in locals(): hana_conn.close() 
 
+
 def interfaz_web():
     st.set_page_config(page_title="Sincronizador FEL a HANA", layout="centered")
     st.title("Sincronización de Documentos FEL")
     
-    # Diccionario basado en los comentarios de tu script
+    # Catálogo de empresas parametrizado
     empresas_catalogo = {
         2: {"nombre": "TIENDAS EN RUTA S.A", "nit": "114909229"},
         3: {"nombre": "MARIO ROLANDO RODRIGUEZ POSADAS", "nit": "4880358"},
@@ -110,9 +190,7 @@ def interfaz_web():
         5: {"nombre": "INVERSIONES CIUDAD VIEJA, S.A.", "nit": "11874937"}
     }
 
-    # Creación del formulario de entrada
     with st.form("form_parametros"):
-        # Mapeo de opciones para el Dropdown (SelectBox)
         opciones = {f"{k} - {v['nombre']}": k for k, v in empresas_catalogo.items()}
         seleccion_empresa = st.selectbox("Seleccione la Empresa:", list(opciones.keys()))
         
@@ -122,14 +200,12 @@ def interfaz_web():
         
         btn_ejecutar = st.form_submit_button("Ejecutar Sincronización")
 
-    # Acción al presionar el botón
     if btn_ejecutar:
         empresa_id = opciones[seleccion_empresa]
         empresa_nombre = empresas_catalogo[empresa_id]["nombre"]
         empresa_nit = empresas_catalogo[empresa_id]["nit"]
         
-        with st.spinner(f"Extrayendo datos de SQL Server para {empresa_nombre}..."):
-            # Las fechas se formatean a string para que SQL Server las interprete correctamente
+        with st.spinner(f"Sincronizando {empresa_nombre}..."):
             resultado = transferir_datos(
                 empresa_id, 
                 empresa_nombre, 
@@ -138,8 +214,10 @@ def interfaz_web():
                 fecha_fin.strftime('%Y-%m-%d')
             )
             
-            if "error" in resultado.lower():
+            if "error crítico" in resultado.lower():
                 st.error(resultado)
+            elif "No hay datos nuevos" in resultado:
+                st.warning(resultado)
             else:
                 st.success(resultado)
 
